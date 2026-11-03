@@ -1,0 +1,188 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+
+      - name: Create project
+        run: |
+          mkdir -p app/src/main/java/com/mybrowser/app
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "MyBrowser"
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.2.2' apply false
+          }
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+          android {
+              namespace 'com.mybrowser.app'
+              compileSdk 34
+              defaultConfig {
+                  applicationId "com.mybrowser.app"
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <application
+                  android:label="Мой браузер"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/mybrowser/app/MainActivity.java <<'EOF'
+          package com.mybrowser.app;
+
+          import android.app.Activity;
+          import android.graphics.Bitmap;
+          import android.os.Bundle;
+          import android.text.InputType;
+          import android.view.inputmethod.EditorInfo;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.LinearLayout;
+
+          public class MainActivity extends Activity {
+              private WebView web;
+              private EditText urlbar;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  int top = (int) (getResources().getDisplayMetrics().density * 24);
+                  root.setPadding(0, top, 0, 0);
+
+                  LinearLayout bar = new LinearLayout(this);
+                  bar.setOrientation(LinearLayout.HORIZONTAL);
+
+                  Button back = new Button(this);
+                  back.setText("<-");
+                  back.setOnClickListener(v -> { if (web.canGoBack()) web.goBack(); });
+
+                  Button next = new Button(this);
+                  next.setText("->");
+                  next.setOnClickListener(v -> { if (web.canGoForward()) web.goForward(); });
+
+                  Button reload = new Button(this);
+                  reload.setText("<°>");
+                  reload.setOnClickListener(v -> web.reload());
+
+                  urlbar = new EditText(this);
+                  urlbar.setSingleLine(true);
+                  urlbar.setInputType(InputType.TYPE_TEXT_VARIATION_URI);
+                  urlbar.setImeOptions(EditorInfo.IME_ACTION_GO);
+                  urlbar.setOnEditorActionListener((v, actionId, event) -> {
+                      navigate(urlbar.getText().toString());
+                      return true;
+                  });
+
+                  bar.addView(back, new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+                  bar.addView(next, new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+                  bar.addView(reload, new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+                  bar.addView(urlbar, new LinearLayout.LayoutParams(
+                          0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+                  web = new WebView(this);
+                  WebSettings s = web.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  web.setWebChromeClient(new WebChromeClient());
+                  web.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public void onPageStarted(WebView view, String url, Bitmap favicon) {
+                          urlbar.setText(url);
+                          urlbar.setSelection(0);
+                      }
+                  });
+
+                  root.addView(bar, new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+                  root.addView(web, new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+                  setContentView(root);
+
+                  web.loadUrl("https://google.com");
+              }
+
+              private void navigate(String text) {
+                  text = text.trim();
+                  if (text.isEmpty()) return;
+                  if (text.startsWith("http://") || text.startsWith("https://")) {
+                      web.loadUrl(text);
+                  } else if (text.contains(".") && !text.contains(" ")) {
+                      web.loadUrl("https://" + text);
+                  } else {
+                      web.loadUrl("https://www.google.com/search?q=" + android.net.Uri.encode(text));
+                  }
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (web.canGoBack()) web.goBack();
+                  else super.onBackPressed();
+              }
+          }
+          EOF
+
+      - name: Build
+        run: gradle assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MyBrowser-apk
+          path: app/build/outputs/apk/debug/app-debug.apk

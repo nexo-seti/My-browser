@@ -1,0 +1,676 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+
+      - name: Create project
+        run: |
+          mkdir -p app/src/main/java/com/mybrowser/app
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "MyBrowser"
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.2.2' apply false
+          }
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+          android {
+              namespace 'com.mybrowser.app'
+              compileSdk 34
+              defaultConfig {
+                  applicationId "com.mybrowser.app"
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28"/>
+              <application
+                  android:label="Мой браузер"
+                  android:usesCleartextTraffic="true"
+                  android:hardwareAccelerated="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/mybrowser/app/MainActivity.java <<'EOF'
+          package com.mybrowser.app;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.app.DownloadManager;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.content.pm.PackageManager;
+          import android.graphics.Bitmap;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Environment;
+          import android.text.InputType;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.view.inputmethod.EditorInfo;
+          import android.view.inputmethod.InputMethodManager;
+          import android.webkit.CookieManager;
+          import android.webkit.URLUtil;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebSettings;
+          import android.webkit.WebStorage;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.widget.AdapterView;
+          import android.widget.ArrayAdapter;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.FrameLayout;
+          import android.widget.LinearLayout;
+          import android.widget.ListView;
+          import android.widget.ProgressBar;
+          import android.widget.Spinner;
+          import android.widget.Toast;
+
+          import java.util.ArrayList;
+
+          public class MainActivity extends Activity {
+              private static final int REQ_FILE = 1;
+              private static final int REQ_STORAGE = 2;
+              private static final String DESKTOP_UA =
+                      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+              private WebView web;
+              private EditText urlbar;
+              private EditText homeSearch;
+              private Spinner engine;
+              private LinearLayout home;
+              private LinearLayout browser;
+              private FrameLayout root;
+              private ProgressBar progress;
+              private SharedPreferences prefs;
+              private boolean desktop = false;
+              private ValueCallback<Uri[]> fileCallback;
+              private View customView;
+              private WebChromeClient.CustomViewCallback customCallback;
+              private String[] pendingDownload;
+
+              private int dp(int v) {
+                  return (int) (v * getResources().getDisplayMetrics().density);
+              }
+
+              private void toast(String t) {
+                  Toast.makeText(this, t, Toast.LENGTH_SHORT).show();
+              }
+
+              private Button btn(String text, View.OnClickListener l) {
+                  Button b = new Button(this);
+                  b.setText(text);
+                  b.setAllCaps(false);
+                  b.setMinWidth(0);
+                  b.setMinimumWidth(0);
+                  b.setPadding(dp(12), 0, dp(12), 0);
+                  b.setOnClickListener(l);
+                  return b;
+              }
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  prefs = getSharedPreferences("browser", MODE_PRIVATE);
+
+                  root = new FrameLayout(this);
+                  root.setPadding(0, dp(24), 0, 0);
+
+                  // ---------- Стартовый экран: строка поиска, выбор поисковика, закладки и история ----------
+                  home = new LinearLayout(this);
+                  home.setOrientation(LinearLayout.VERTICAL);
+                  home.setGravity(Gravity.CENTER);
+                  home.setPadding(dp(16), 0, dp(16), 0);
+
+                  LinearLayout row = new LinearLayout(this);
+                  row.setOrientation(LinearLayout.HORIZONTAL);
+                  row.setGravity(Gravity.CENTER_VERTICAL);
+
+                  homeSearch = new EditText(this);
+                  homeSearch.setHint("Поиск");
+                  homeSearch.setSingleLine(true);
+                  homeSearch.setInputType(InputType.TYPE_TEXT_VARIATION_URI);
+                  homeSearch.setImeOptions(EditorInfo.IME_ACTION_SEARCH);
+                  homeSearch.setOnEditorActionListener((tv, actionId, event) -> {
+                      search(homeSearch.getText().toString());
+                      return true;
+                  });
+
+                  engine = new Spinner(this);
+                  engine.setAdapter(new ArrayAdapter<String>(this,
+                          android.R.layout.simple_spinner_dropdown_item,
+                          new String[]{"Яндекс", "Google", "DuckDuckGo"}));
+                  engine.setSelection(prefs.getInt("engine", 0));
+                  engine.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+                      @Override
+                      public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                          prefs.edit().putInt("engine", position).apply();
+                      }
+
+                      @Override
+                      public void onNothingSelected(AdapterView<?> parent) {
+                      }
+                  });
+
+                  row.addView(homeSearch, new LinearLayout.LayoutParams(
+                          0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+                  row.addView(engine, new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+                  home.addView(row, new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
+                  LinearLayout links = new LinearLayout(this);
+                  links.setOrientation(LinearLayout.HORIZONTAL);
+                  links.setGravity(Gravity.CENTER);
+                  links.addView(btn("⭐ Закладки", x -> showList("bookmarks", "Закладки")));
+                  links.addView(btn("🕘 История", x -> showList("history", "История")));
+                  LinearLayout.LayoutParams linksLp = new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+                  linksLp.topMargin = dp(16);
+                  home.addView(links, linksLp);
+
+                  // ---------- Браузер ----------
+                  browser = new LinearLayout(this);
+                  browser.setOrientation(LinearLayout.VERTICAL);
+
+                  LinearLayout bar = new LinearLayout(this);
+                  bar.setOrientation(LinearLayout.HORIZONTAL);
+                  bar.setGravity(Gravity.CENTER_VERTICAL);
+
+                  Button back = btn("←", x -> { if (web.canGoBack()) web.goBack(); });
+                  Button next = btn("→", x -> { if (web.canGoForward()) web.goForward(); });
+                  Button reload = btn("↻", x -> web.reload());
+                  Button menu = btn("⋮", x -> showMenu());
+
+                  urlbar = new EditText(this);
+                  urlbar.setSingleLine(true);
+                  urlbar.setSelectAllOnFocus(true);
+                  urlbar.setInputType(InputType.TYPE_TEXT_VARIATION_URI);
+                  urlbar.setImeOptions(EditorInfo.IME_ACTION_GO);
+                  urlbar.setOnEditorActionListener((tv, actionId, event) -> {
+                      search(urlbar.getText().toString());
+                      return true;
+                  });
+
+                  bar.addView(back, new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+                  bar.addView(next, new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+                  bar.addView(urlbar, new LinearLayout.LayoutParams(
+                          0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+                  bar.addView(reload, new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+                  bar.addView(menu, new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
+                  progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+                  progress.setMax(100);
+                  progress.setVisibility(View.GONE);
+
+                  web = new WebView(this);
+                  WebSettings s = web.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setUseWideViewPort(true);
+                  s.setLoadWithOverviewMode(true);
+                  s.setSupportZoom(true);
+                  s.setBuiltInZoomControls(true);
+                  s.setDisplayZoomControls(false);
+                  s.setAllowFileAccess(false);
+                  s.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
+                  CookieManager.getInstance().setAcceptCookie(true);
+                  CookieManager.getInstance().setAcceptThirdPartyCookies(web, true);
+
+                  web.setWebChromeClient(new WebChromeClient() {
+                      @Override
+                      public void onProgressChanged(WebView view, int newProgress) {
+                          progress.setProgress(newProgress);
+                          progress.setVisibility(newProgress < 100 ? View.VISIBLE : View.GONE);
+                      }
+
+                      // Выбор файла (<input type="file">)
+                      @Override
+                      public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> cb,
+                                                       FileChooserParams params) {
+                          if (fileCallback != null) fileCallback.onReceiveValue(null);
+                          fileCallback = cb;
+                          try {
+                              startActivityForResult(params.createIntent(), REQ_FILE);
+                          } catch (Exception e) {
+                              fileCallback = null;
+                              toast("Не удалось открыть выбор файла");
+                              return false;
+                          }
+                          return true;
+                      }
+
+                      // Видео на весь экран
+                      @Override
+                      public void onShowCustomView(View view, CustomViewCallback cb) {
+                          if (customView != null) {
+                              cb.onCustomViewHidden();
+                              return;
+                          }
+                          customView = view;
+                          customCallback = cb;
+                          ((FrameLayout) getWindow().getDecorView()).addView(view,
+                                  new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                                          ViewGroup.LayoutParams.MATCH_PARENT));
+                          getWindow().getDecorView().setSystemUiVisibility(
+                                  View.SYSTEM_UI_FLAG_FULLSCREEN
+                                          | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                                          | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
+                      }
+
+                      @Override
+                      public void onHideCustomView() {
+                          hideCustomView();
+                      }
+                  });
+
+                  web.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public void onPageStarted(WebView view, String url, Bitmap favicon) {
+                          urlbar.setText(url);
+                          urlbar.setSelection(0);
+                      }
+
+                      @Override
+                      public void onPageFinished(WebView view, String url) {
+                          addHistory(view.getTitle(), url);
+                      }
+
+                      @Override
+                      public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                          return handleExternal(request.getUrl().toString());
+                      }
+                  });
+
+                  // Скачивание файлов
+                  web.setDownloadListener((dlUrl, dlUa, dlDisp, dlMime, dlLen) -> {
+                      if (Build.VERSION.SDK_INT < 29
+                              && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                              != PackageManager.PERMISSION_GRANTED) {
+                          pendingDownload = new String[]{dlUrl, dlUa, dlDisp, dlMime};
+                          requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, REQ_STORAGE);
+                          return;
+                      }
+                      startDownload(dlUrl, dlUa, dlDisp, dlMime);
+                  });
+
+                  browser.addView(bar, new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+                  browser.addView(progress, new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, dp(3)));
+                  browser.addView(web, new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+
+                  root.addView(home, new FrameLayout.LayoutParams(
+                          FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+                  root.addView(browser, new FrameLayout.LayoutParams(
+                          FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+                  setContentView(root);
+
+                  showHome();
+              }
+
+              // ---------- Экраны ----------
+
+              private void showHome() {
+                  browser.setVisibility(View.GONE);
+                  home.setVisibility(View.VISIBLE);
+                  homeSearch.setText("");
+              }
+
+              private void showBrowser() {
+                  home.setVisibility(View.GONE);
+                  browser.setVisibility(View.VISIBLE);
+                  InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+                  if (imm != null) imm.hideSoftInputFromWindow(root.getWindowToken(), 0);
+              }
+
+              private void open(String url) {
+                  showBrowser();
+                  web.loadUrl(url);
+              }
+
+              private void search(String text) {
+                  text = text.trim();
+                  if (text.isEmpty()) return;
+                  String url;
+                  int e = engine.getSelectedItemPosition();
+                  if (text.startsWith("http://") || text.startsWith("https://")) {
+                      url = text;
+                  } else if (text.contains(".") && !text.contains(" ")) {
+                      url = "https://" + text;
+                  } else if (e == 0) {
+                      url = "https://yandex.ru/search/?text=" + Uri.encode(text);
+                  } else if (e == 1) {
+                      url = "https://www.google.com/search?q=" + Uri.encode(text);
+                  } else {
+                      url = "https://duckduckgo.com/?q=" + Uri.encode(text);
+                  }
+                  open(url);
+              }
+
+              // tel:, mailto:, intent:, market: и прочие нестандартные ссылки открываем во внешних приложениях
+              private boolean handleExternal(String u) {
+                  if (u.startsWith("http://") || u.startsWith("https://")
+                          || u.startsWith("about:") || u.startsWith("data:") || u.startsWith("blob:")) {
+                      return false;
+                  }
+                  try {
+                      Intent i;
+                      if (u.startsWith("intent:")) {
+                          i = Intent.parseUri(u, Intent.URI_INTENT_SCHEME);
+                          i.addCategory(Intent.CATEGORY_BROWSABLE);
+                          i.setComponent(null);
+                          i.setSelector(null);
+                      } else {
+                          i = new Intent(Intent.ACTION_VIEW, Uri.parse(u));
+                      }
+                      startActivity(i);
+                  } catch (Exception ex) {
+                      toast("Не удалось открыть ссылку");
+                  }
+                  return true;
+              }
+
+              // ---------- Меню ----------
+
+              private void showMenu() {
+                  final String[] items = {
+                          "🏠 На главную",
+                          "⭐ В закладки",
+                          "📚 Закладки",
+                          "🕘 История",
+                          desktop ? "📱 Мобильная версия" : "🖥 Версия для ПК",
+                          "📤 Поделиться ссылкой",
+                          "🧹 Очистить данные сайтов"
+                  };
+                  new AlertDialog.Builder(this).setItems(items, (dlg, which) -> {
+                      switch (which) {
+                          case 0: showHome(); break;
+                          case 1: addBookmark(); break;
+                          case 2: showList("bookmarks", "Закладки"); break;
+                          case 3: showList("history", "История"); break;
+                          case 4: toggleDesktop(); break;
+                          case 5: shareLink(); break;
+                          case 6: clearData(); break;
+                      }
+                  }).show();
+              }
+
+              private void toggleDesktop() {
+                  desktop = !desktop;
+                  web.getSettings().setUserAgentString(desktop ? DESKTOP_UA : null);
+                  web.reload();
+                  toast(desktop ? "Версия для ПК включена" : "Мобильная версия включена");
+              }
+
+              private void shareLink() {
+                  String u = web.getUrl();
+                  if (u == null) {
+                      toast("Нет открытой страницы");
+                      return;
+                  }
+                  Intent i = new Intent(Intent.ACTION_SEND);
+                  i.setType("text/plain");
+                  i.putExtra(Intent.EXTRA_TEXT, u);
+                  startActivity(Intent.createChooser(i, "Поделиться"));
+              }
+
+              private void clearData() {
+                  web.clearCache(true);
+                  web.clearHistory();
+                  CookieManager.getInstance().removeAllCookies(null);
+                  WebStorage.getInstance().deleteAllData();
+                  toast("Куки и кэш очищены");
+              }
+
+              // ---------- Закладки и история ----------
+
+              private String clean(String s) {
+                  return s == null ? "" : s.replace('\t', ' ').replace('\n', ' ').trim();
+              }
+
+              private ArrayList<String[]> loadList(String key) {
+                  ArrayList<String[]> out = new ArrayList<>();
+                  String raw = prefs.getString(key, "");
+                  for (String line : raw.split("\n")) {
+                      int t = line.indexOf('\t');
+                      if (t > 0) out.add(new String[]{line.substring(0, t), line.substring(t + 1)});
+                  }
+                  return out;
+              }
+
+              private void saveList(String key, ArrayList<String[]> list) {
+                  StringBuilder sb = new StringBuilder();
+                  for (String[] e : list) sb.append(e[0]).append('\t').append(e[1]).append('\n');
+                  prefs.edit().putString(key, sb.toString()).apply();
+              }
+
+              private void addBookmark() {
+                  String u = web.getUrl();
+                  if (u == null || u.equals("about:blank")) {
+                      toast("Нечего добавлять");
+                      return;
+                  }
+                  String t = clean(web.getTitle());
+                  if (t.isEmpty()) t = u;
+                  ArrayList<String[]> list = loadList("bookmarks");
+                  for (int i = list.size() - 1; i >= 0; i--) {
+                      if (list.get(i)[1].equals(u)) list.remove(i);
+                  }
+                  list.add(0, new String[]{t, u});
+                  saveList("bookmarks", list);
+                  toast("Добавлено в закладки ⭐");
+              }
+
+              private void addHistory(String title, String u) {
+                  if (u == null || u.equals("about:blank")) return;
+                  String t = clean(title);
+                  if (t.isEmpty()) t = u;
+                  ArrayList<String[]> list = loadList("history");
+                  if (!list.isEmpty() && list.get(0)[1].equals(u)) return;
+                  list.add(0, new String[]{t, u});
+                  while (list.size() > 100) list.remove(list.size() - 1);
+                  saveList("history", list);
+              }
+
+              private void showList(final String key, String title) {
+                  final ArrayList<String[]> list = loadList(key);
+                  if (list.isEmpty()) {
+                      toast("Пока пусто");
+                      return;
+                  }
+                  final ArrayList<String> names = new ArrayList<>();
+                  for (String[] b : list) names.add(b[0] + "\n" + b[1]);
+                  final ArrayAdapter<String> ad = new ArrayAdapter<>(this,
+                          android.R.layout.simple_list_item_1, names);
+                  ListView lv = new ListView(this);
+                  lv.setAdapter(ad);
+
+                  AlertDialog.Builder builder = new AlertDialog.Builder(this)
+                          .setTitle(title + " (долгое нажатие — удалить)")
+                          .setView(lv)
+                          .setNegativeButton("Закрыть", null);
+                  if (key.equals("history")) {
+                      builder.setNeutralButton("Очистить всё", (d2, w2) -> {
+                          prefs.edit().remove("history").apply();
+                          toast("История очищена");
+                      });
+                  }
+                  final AlertDialog dlg = builder.create();
+
+                  lv.setOnItemClickListener((p, v, pos, id) -> {
+                      dlg.dismiss();
+                      open(list.get(pos)[1]);
+                  });
+                  lv.setOnItemLongClickListener((p, v, pos, id) -> {
+                      list.remove(pos);
+                      names.remove(pos);
+                      saveList(key, list);
+                      ad.notifyDataSetChanged();
+                      toast("Удалено");
+                      if (list.isEmpty()) dlg.dismiss();
+                      return true;
+                  });
+                  dlg.show();
+              }
+
+              // ---------- Скачивание ----------
+
+              private void startDownload(String u, String ua, String disp, String mime) {
+                  if (u.startsWith("blob:") || u.startsWith("data:")) {
+                      toast("Этот тип скачивания не поддерживается");
+                      return;
+                  }
+                  try {
+                      String name = URLUtil.guessFileName(u, disp, mime);
+                      DownloadManager.Request r = new DownloadManager.Request(Uri.parse(u));
+                      if (mime != null && !mime.isEmpty()) r.setMimeType(mime);
+                      String cookie = CookieManager.getInstance().getCookie(u);
+                      if (cookie != null) r.addRequestHeader("Cookie", cookie);
+                      if (ua != null) r.addRequestHeader("User-Agent", ua);
+                      r.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+                      r.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name);
+                      ((DownloadManager) getSystemService(DOWNLOAD_SERVICE)).enqueue(r);
+                      toast("Скачивание: " + name);
+                  } catch (Exception e) {
+                      toast("Не удалось скачать файл");
+                  }
+              }
+
+              @Override
+              public void onRequestPermissionsResult(int code, String[] perms, int[] results) {
+                  super.onRequestPermissionsResult(code, perms, results);
+                  if (code == REQ_STORAGE && pendingDownload != null) {
+                      String[] p = pendingDownload;
+                      pendingDownload = null;
+                      if (results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) {
+                          startDownload(p[0], p[1], p[2], p[3]);
+                      } else {
+                          toast("Нужно разрешение на запись файлов");
+                      }
+                  }
+              }
+
+              @Override
+              protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  super.onActivityResult(requestCode, resultCode, data);
+                  if (requestCode == REQ_FILE && fileCallback != null) {
+                      fileCallback.onReceiveValue(
+                              WebChromeClient.FileChooserParams.parseResult(resultCode, data));
+                      fileCallback = null;
+                  }
+              }
+
+              // ---------- Видео на весь экран ----------
+
+              private void hideCustomView() {
+                  if (customView == null) return;
+                  View decor = getWindow().getDecorView();
+                  ((FrameLayout) decor).removeView(customView);
+                  customView = null;
+                  decor.setSystemUiVisibility(View.SYSTEM_UI_FLAG_VISIBLE);
+                  WebChromeClient.CustomViewCallback cb = customCallback;
+                  customCallback = null;
+                  if (cb != null) cb.onCustomViewHidden();
+              }
+
+              // ---------- Жизненный цикл ----------
+
+              @Override
+              protected void onPause() {
+                  super.onPause();
+                  web.onPause();
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  web.onResume();
+              }
+
+              @Override
+              protected void onDestroy() {
+                  web.destroy();
+                  super.onDestroy();
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (customView != null) {
+                      hideCustomView();
+                  } else if (browser.getVisibility() == View.VISIBLE) {
+                      if (web.canGoBack()) web.goBack();
+                      else showHome();
+                  } else {
+                      super.onBackPressed();
+                  }
+              }
+          }
+          EOF
+
+      - name: Build
+        run: gradle assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MyBrowser-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
